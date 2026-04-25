@@ -10,7 +10,7 @@ use axum::http::{
 };
 use reqwest::Client;
 use serde_json::{Map, Value, json};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{ReconnectConfig, ServerConfig};
 use crate::constants::MCP_SESSION_ID;
@@ -359,12 +359,23 @@ pub(crate) async fn upstream_request(
         return Err(error);
     }
 
+    debug!(
+        server = %config.name,
+        reason = %reason,
+        error = %error,
+        "upstream session-rejection response"
+    );
+
     let reset_lock = upstream_session_reset_lock(state, &config.name).await;
     let _reset_guard = reset_lock.lock().await;
 
     if let Some(current_session) = current_server_session_id(state, &config.name).await
         && Some(current_session.as_str()) != session_id
     {
+        debug!(
+            server = %config.name,
+            "upstream session already refreshed by concurrent request; retrying"
+        );
         let retry = upstream_request_raw(
             state,
             config,
@@ -387,6 +398,11 @@ pub(crate) async fn upstream_request(
         }
     }
 
+    info!(
+        server = %config.name,
+        reason = %reason,
+        "upstream session invalidated; re-initializing"
+    );
     record_upstream_session_reset(state, &config.name, reason).await;
     replace_server_session_id(state, &config.name, None).await;
 
