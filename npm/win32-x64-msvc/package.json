@@ -1,6 +1,6 @@
 {
   "name": "@ahkohd/mcpstead-win32-x64-msvc",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Prebuilt binaries for @ahkohd/mcpstead (win32 x64 msvc)",
   "license": "MIT",
   "repository": {

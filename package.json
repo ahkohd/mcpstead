@@ -1,6 +1,6 @@
 {
   "name": "@ahkohd/mcpstead",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "MCP gateway",
   "license": "MIT",
   "repository": {
@@ -24,10 +24,10 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@ahkohd/mcpstead-darwin-arm64": "0.1.4",
-    "@ahkohd/mcpstead-darwin-x64": "0.1.4",
-    "@ahkohd/mcpstead-linux-x64-gnu": "0.1.4",
-    "@ahkohd/mcpstead-win32-x64-msvc": "0.1.4"
+    "@ahkohd/mcpstead-darwin-arm64": "0.1.5",
+    "@ahkohd/mcpstead-darwin-x64": "0.1.5",
+    "@ahkohd/mcpstead-linux-x64-gnu": "0.1.5",
+    "@ahkohd/mcpstead-win32-x64-msvc": "0.1.5"
   },
   "scripts": {
     "pack:dry": "npm pack --dry-run",
