@@ -1,6 +1,6 @@
 {
   "name": "@ahkohd/mcpstead-darwin-x64",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Prebuilt binaries for @ahkohd/mcpstead (darwin x64)",
   "license": "MIT",
   "repository": {
