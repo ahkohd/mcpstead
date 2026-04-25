@@ -116,7 +116,7 @@ mcp:
     mode: bearer
 ```
 
-Token comes from env, never from config:
+Token comes from env:
 
 ```bash
 export MCPSTEAD_BEARER_TOKEN='replace-with-strong-secret'
