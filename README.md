@@ -238,6 +238,7 @@ mcpstead_upstream_reconnect_attempts_total{server="...",result="success|error"}
 mcpstead_upstream_backoff_seconds_total{server="..."}
 mcpstead_upstream_in_backoff{server="..."}
 mcpstead_upstream_current_backoff_seconds{server="..."}
+mcpstead_upstream_session_resets_total{server="...",reason="unknown_session|expired|terminated"}
 mcpstead_upstream_tools_refresh_total{server="...",result="success|error"}
 mcpstead_upstream_tools_refresh_duration_seconds_bucket{server="...",le="..."}
 mcpstead_upstream_tools_last_refresh_timestamp_seconds{server="..."}

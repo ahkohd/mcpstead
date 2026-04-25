@@ -311,6 +311,17 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Response {
         ));
     }
 
+    output.push_str("# HELP mcpstead_upstream_session_resets_total Upstream session resets after session invalidation.\n");
+    output.push_str("# TYPE mcpstead_upstream_session_resets_total counter\n");
+    for ((server, reason), value) in &metrics.upstream_session_resets {
+        output.push_str(&format!(
+            "mcpstead_upstream_session_resets_total{{server=\"{}\",reason=\"{}\"}} {}\n",
+            escape_label(server),
+            escape_label(reason),
+            value
+        ));
+    }
+
     output.push_str("# HELP mcpstead_upstream_tools_refresh_total Upstream tools/list cache refresh outcomes.\n");
     output.push_str("# TYPE mcpstead_upstream_tools_refresh_total counter\n");
     for ((server, result), value) in &metrics.upstream_tools_refresh {

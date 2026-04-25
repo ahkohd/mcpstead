@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::http::{
@@ -12,6 +15,26 @@ use tracing::{debug, error, warn};
 use crate::config::{ReconnectConfig, ServerConfig};
 use crate::constants::MCP_SESSION_ID;
 use crate::state::AppState;
+
+#[derive(Debug)]
+struct UpstreamResponseError {
+    message: String,
+    session_reset_reason: Option<&'static str>,
+}
+
+impl std::fmt::Display for UpstreamResponseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UpstreamResponseError {}
+
+fn session_reset_reason_from_error(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .downcast_ref::<UpstreamResponseError>()
+        .and_then(|error| error.session_reset_reason)
+}
 
 pub(crate) async fn server_names(state: &AppState) -> Vec<String> {
     state
@@ -125,6 +148,34 @@ async fn set_server_disconnected(state: &AppState, name: &str, error: String) {
     }
 }
 
+async fn replace_server_session_id(state: &AppState, name: &str, session_id: Option<String>) {
+    let mut registry = state.registry.write().await;
+    if let Some(server) = registry.servers.get_mut(name) {
+        server.session_id = session_id;
+        server.connected = true;
+        server.last_error = None;
+        server.last_seen = Some(Instant::now());
+    }
+}
+
+async fn current_server_session_id(state: &AppState, name: &str) -> Option<String> {
+    state
+        .registry
+        .read()
+        .await
+        .servers
+        .get(name)
+        .and_then(|server| server.session_id.clone())
+}
+
+async fn upstream_session_reset_lock(state: &AppState, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = state.upstream_session_reset_locks.lock().await;
+    locks
+        .entry(name.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 async fn record_upstream_health_check(state: &AppState, server: &str, result: &str) {
     state
         .metrics
@@ -165,6 +216,14 @@ async fn record_upstream_bytes(state: &AppState, server: &str, direction: &str, 
         .record_upstream_bytes(server, direction, bytes);
 }
 
+async fn record_upstream_session_reset(state: &AppState, server: &str, reason: &str) {
+    state
+        .metrics
+        .lock()
+        .await
+        .record_upstream_session_reset(server, reason);
+}
+
 fn upstream_client<'a>(state: &'a AppState, config: &ServerConfig) -> &'a Client {
     if config.tls_skip_verify {
         &state.insecure_client
@@ -177,6 +236,14 @@ async fn initialize_and_load_tools(
     state: &AppState,
     config: &ServerConfig,
 ) -> Result<(Option<String>, Vec<Value>)> {
+    let session_id = initialize_upstream_session(state, config).await?;
+    load_tools(state, config, session_id.as_deref()).await
+}
+
+async fn initialize_upstream_session(
+    state: &AppState,
+    config: &ServerConfig,
+) -> Result<Option<String>> {
     let params = json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {},
@@ -186,7 +253,8 @@ async fn initialize_and_load_tools(
         }
     });
     let started = Instant::now();
-    let initialize = upstream_request(state, config, None, json!(1), "initialize", params).await;
+    let initialize =
+        upstream_request_raw(state, config, None, json!(1), "initialize", params).await;
     let duration = started.elapsed().as_secs_f64();
     match &initialize {
         Ok(_) => {
@@ -213,7 +281,7 @@ async fn initialize_and_load_tools(
         Value::Null,
     )
     .await;
-    load_tools(state, config, session_id.as_deref()).await
+    Ok(session_id)
 }
 
 async fn load_tools(
@@ -271,6 +339,89 @@ pub(crate) async fn upstream_request(
     method: &str,
     params: Value,
 ) -> Result<(Option<String>, Value)> {
+    let result = upstream_request_raw(
+        state,
+        config,
+        session_id,
+        id.clone(),
+        method,
+        params.clone(),
+    )
+    .await;
+    let Err(error) = result else {
+        return result;
+    };
+
+    let Some(reason) = session_reset_reason_from_error(&error) else {
+        return Err(error);
+    };
+    if session_id.is_none() || method == "initialize" {
+        return Err(error);
+    }
+
+    let reset_lock = upstream_session_reset_lock(state, &config.name).await;
+    let _reset_guard = reset_lock.lock().await;
+
+    if let Some(current_session) = current_server_session_id(state, &config.name).await
+        && Some(current_session.as_str()) != session_id
+    {
+        let retry = upstream_request_raw(
+            state,
+            config,
+            Some(&current_session),
+            id.clone(),
+            method,
+            params.clone(),
+        )
+        .await;
+        match retry {
+            Ok((next_session_id, result)) => {
+                let session = next_session_id.or(Some(current_session));
+                replace_server_session_id(state, &config.name, session.clone()).await;
+                return Ok((session, result));
+            }
+            Err(retry_error) if session_reset_reason_from_error(&retry_error).is_none() => {
+                return Err(retry_error);
+            }
+            Err(_) => {}
+        }
+    }
+
+    record_upstream_session_reset(state, &config.name, reason).await;
+    replace_server_session_id(state, &config.name, None).await;
+
+    let session = match initialize_upstream_session(state, config).await {
+        Ok(session) => session,
+        Err(_) => return Err(error),
+    };
+    replace_server_session_id(state, &config.name, session.clone()).await;
+
+    let retry = upstream_request_raw(state, config, session.as_deref(), id, method, params).await;
+    match retry {
+        Ok((next_session_id, result)) => {
+            let session = next_session_id.or(session);
+            replace_server_session_id(state, &config.name, session.clone()).await;
+            Ok((session, result))
+        }
+        Err(retry_error) => {
+            if session_reset_reason_from_error(&retry_error).is_some() {
+                replace_server_session_id(state, &config.name, None).await;
+                Err(error)
+            } else {
+                Err(retry_error)
+            }
+        }
+    }
+}
+
+async fn upstream_request_raw(
+    state: &AppState,
+    config: &ServerConfig,
+    session_id: Option<&str>,
+    id: Value,
+    method: &str,
+    params: Value,
+) -> Result<(Option<String>, Value)> {
     let body = json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -281,7 +432,11 @@ pub(crate) async fn upstream_request(
     let response =
         response.ok_or_else(|| anyhow!("upstream '{}' returned no body", config.name))?;
     if let Some(error) = response.get("error") {
-        bail!("upstream '{}' JSON-RPC error: {}", config.name, error);
+        return Err(UpstreamResponseError {
+            message: format!("upstream '{}' JSON-RPC error: {}", config.name, error),
+            session_reset_reason: classify_json_rpc_session_reset(error),
+        }
+        .into());
     }
     Ok((
         next_session_id,
@@ -364,12 +519,17 @@ async fn parse_upstream_response(
 
     if !status.is_success() {
         let text = String::from_utf8_lossy(&bytes);
-        bail!(
-            "upstream '{}' HTTP {}: {}",
-            config.name,
-            status.as_u16(),
-            text.chars().take(512).collect::<String>()
-        );
+        let body = text.chars().take(512).collect::<String>();
+        return Err(UpstreamResponseError {
+            message: format!(
+                "upstream '{}' HTTP {}: {}",
+                config.name,
+                status.as_u16(),
+                body
+            ),
+            session_reset_reason: classify_http_session_reset(status, &text),
+        }
+        .into());
     }
 
     if bytes.is_empty() {
@@ -378,6 +538,65 @@ async fn parse_upstream_response(
 
     let value = parse_mcp_body(content_type.as_deref(), &bytes)?;
     Ok((session_id, Some(value)))
+}
+
+fn classify_http_session_reset(status: StatusCode, body: &str) -> Option<&'static str> {
+    let value = serde_json::from_str::<Value>(body).ok();
+    if status == StatusCode::NOT_FOUND
+        && value
+            .as_ref()
+            .and_then(json_rpc_error_code)
+            .is_some_and(|code| code == -32001)
+    {
+        return Some("unknown_session");
+    }
+
+    if !matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::GONE
+    ) {
+        return None;
+    }
+
+    if let Some(message) = value.as_ref().and_then(json_rpc_error_message)
+        && let Some(reason) = classify_session_message(message)
+    {
+        return Some(reason);
+    }
+    classify_session_message(body)
+}
+
+fn classify_json_rpc_session_reset(error: &Value) -> Option<&'static str> {
+    if json_rpc_error_code(error).is_some_and(|code| code == -32001) {
+        return Some("unknown_session");
+    }
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .and_then(classify_session_message)
+}
+
+fn json_rpc_error_code(value: &Value) -> Option<i64> {
+    let error = value.get("error").unwrap_or(value);
+    error.get("code").and_then(Value::as_i64)
+}
+
+fn json_rpc_error_message(value: &Value) -> Option<&str> {
+    let error = value.get("error").unwrap_or(value);
+    error.get("message").and_then(Value::as_str)
+}
+
+fn classify_session_message(message: &str) -> Option<&'static str> {
+    let message = message.to_ascii_lowercase();
+    if message.contains("unknown mcp session") {
+        Some("unknown_session")
+    } else if message.contains("session expired") {
+        Some("expired")
+    } else if message.contains("session terminated") {
+        Some("terminated")
+    } else {
+        None
+    }
 }
 
 fn parse_mcp_body(content_type: Option<&str>, bytes: &[u8]) -> Result<Value> {
@@ -489,6 +708,21 @@ fn push_sse_event(
 mod tests {
     use super::*;
 
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::HeaderMap,
+        response::{IntoResponse, Response},
+        routing::post,
+    };
+
+    use crate::{config::Config, constants::MCP_SESSION_ID, state::build_state};
+
     #[test]
     fn parses_plain_json_body() {
         let value = parse_mcp_body(
@@ -556,5 +790,228 @@ mod tests {
         assert_eq!(backoff_delay(&config, 1), Duration::from_millis(100));
         assert_eq!(backoff_delay(&config, 2), Duration::from_millis(200));
         assert_eq!(backoff_delay(&config, 20), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn classifies_session_reset_reasons() {
+        assert_eq!(
+            classify_http_session_reset(
+                StatusCode::NOT_FOUND,
+                r#"{"code":-32001,"message":"Unknown MCP session"}"#,
+            ),
+            Some("unknown_session")
+        );
+        assert_eq!(
+            classify_http_session_reset(
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":{"message":"session expired"}}"#,
+            ),
+            Some("expired")
+        );
+        assert_eq!(
+            classify_http_session_reset(StatusCode::FORBIDDEN, "session terminated"),
+            Some("terminated")
+        );
+    }
+
+    #[derive(Clone)]
+    struct SessionResetServer {
+        initialize_calls: Arc<AtomicUsize>,
+        tool_calls: Arc<AtomicUsize>,
+        always_reject_tools: bool,
+    }
+
+    async fn session_reset_handler(
+        State(server): State<SessionResetServer>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = body.get("id").cloned().unwrap_or(Value::Null);
+        match method {
+            "initialize" => {
+                server.initialize_calls.fetch_add(1, Ordering::Relaxed);
+                let mut response = Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {}
+                }))
+                .into_response();
+                response
+                    .headers_mut()
+                    .insert(MCP_SESSION_ID, "fresh-session".parse().unwrap());
+                response
+            }
+            "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
+            "tools/call" => {
+                server.tool_calls.fetch_add(1, Ordering::Relaxed);
+                let session = headers
+                    .get(MCP_SESSION_ID)
+                    .and_then(|value| value.to_str().ok());
+                if server.always_reject_tools || session != Some("fresh-session") {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({
+                            "code": -32001,
+                            "message": "Unknown MCP session"
+                        })),
+                    )
+                        .into_response();
+                }
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {"ok": true}
+                }))
+                .into_response()
+            }
+            _ => Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {}
+            }))
+            .into_response(),
+        }
+    }
+
+    async fn session_reset_test_state(
+        always_reject_tools: bool,
+    ) -> (AppState, ServerConfig, SessionResetServer) {
+        let server = SessionResetServer {
+            initialize_calls: Arc::new(AtomicUsize::new(0)),
+            tool_calls: Arc::new(AtomicUsize::new(0)),
+            always_reject_tools,
+        };
+        let observed_server = server.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/", post(session_reset_handler))
+            .with_state(server);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = ServerConfig::default();
+        config.name = "example".to_string();
+        config.url = url;
+        let state = build_state(
+            &Config {
+                servers: vec![config.clone()],
+                ..Config::default()
+            },
+            None,
+        )
+        .unwrap();
+        {
+            let mut registry = state.registry.write().await;
+            let server = registry.servers.get_mut("example").unwrap();
+            server.connected = true;
+            server.session_id = Some("stale-session".to_string());
+        }
+        (state, config, observed_server)
+    }
+
+    #[tokio::test]
+    async fn resets_invalid_upstream_session_and_retries_request() {
+        let (state, config, _server) = session_reset_test_state(false).await;
+
+        let (session_id, result) = upstream_request(
+            &state,
+            &config,
+            Some("stale-session"),
+            json!(7),
+            "tools/call",
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session_id.as_deref(), Some("fresh-session"));
+        assert_eq!(result, json!({"ok": true}));
+        let registry = state.registry.read().await;
+        assert_eq!(
+            registry.servers["example"].session_id.as_deref(),
+            Some("fresh-session")
+        );
+        drop(registry);
+        assert_eq!(
+            state
+                .metrics
+                .lock()
+                .await
+                .upstream_session_resets
+                .get(&("example".to_string(), "unknown_session".to_string())),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_resets_share_one_reinitialize() {
+        let (state, config, server) = session_reset_test_state(false).await;
+
+        let first = upstream_request(
+            &state,
+            &config,
+            Some("stale-session"),
+            json!(8),
+            "tools/call",
+            json!({}),
+        );
+        let second = upstream_request(
+            &state,
+            &config,
+            Some("stale-session"),
+            json!(9),
+            "tools/call",
+            json!({}),
+        );
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(first.unwrap().1, json!({"ok": true}));
+        assert_eq!(second.unwrap().1, json!({"ok": true}));
+        assert_eq!(server.initialize_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state
+                .metrics
+                .lock()
+                .await
+                .upstream_session_resets
+                .get(&("example".to_string(), "unknown_session".to_string())),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn only_retries_session_reset_once() {
+        let (state, config, _server) = session_reset_test_state(true).await;
+
+        let error = upstream_request(
+            &state,
+            &config,
+            Some("stale-session"),
+            json!(8),
+            "tools/call",
+            json!({}),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("HTTP 404"));
+        assert_eq!(
+            state.registry.read().await.servers["example"]
+                .session_id
+                .as_deref(),
+            None
+        );
+        assert_eq!(
+            state
+                .metrics
+                .lock()
+                .await
+                .upstream_session_resets
+                .get(&("example".to_string(), "unknown_session".to_string())),
+            Some(&1)
+        );
     }
 }

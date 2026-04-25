@@ -26,6 +26,7 @@ pub(crate) struct AppState {
     pub(crate) registry: Arc<RwLock<Registry>>,
     pub(crate) metrics: Arc<Mutex<Metrics>>,
     pub(crate) sessions: Arc<RwLock<HashMap<String, DownstreamSession>>>,
+    pub(crate) upstream_session_reset_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub(crate) accepting_new_sessions: Arc<AtomicBool>,
     pub(crate) session_idle_ttl: Duration,
     pub(crate) session_gc_interval: Duration,
@@ -89,6 +90,7 @@ pub(crate) struct Metrics {
     pub(crate) upstream_backoff_seconds_total: BTreeMap<String, f64>,
     pub(crate) upstream_in_backoff: BTreeMap<String, u64>,
     pub(crate) upstream_current_backoff_seconds: BTreeMap<String, f64>,
+    pub(crate) upstream_session_resets: BTreeMap<(String, String), u64>,
     pub(crate) upstream_tools_refresh: BTreeMap<(String, String), u64>,
     pub(crate) upstream_tools_refresh_duration: BTreeMap<String, HistogramMetric>,
     pub(crate) upstream_tools_last_refresh_timestamp_seconds: BTreeMap<String, f64>,
@@ -187,6 +189,13 @@ impl Metrics {
         self.upstream_in_backoff.insert(server.to_string(), 0);
         self.upstream_current_backoff_seconds
             .insert(server.to_string(), 0.0);
+    }
+
+    pub(crate) fn record_upstream_session_reset(&mut self, server: &str, reason: &str) {
+        *self
+            .upstream_session_resets
+            .entry((server.to_string(), reason.to_string()))
+            .or_insert(0) += 1;
     }
 
     pub(crate) fn record_upstream_tools_refresh(
@@ -362,6 +371,7 @@ pub(crate) fn build_state(config: &Config, mcp_bearer_token: Option<String>) -> 
         registry: Arc::new(RwLock::new(registry)),
         metrics: Arc::new(Mutex::new(Metrics::default())),
         sessions: Arc::new(RwLock::new(HashMap::new())),
+        upstream_session_reset_locks: Arc::new(Mutex::new(HashMap::new())),
         accepting_new_sessions: Arc::new(AtomicBool::new(true)),
         session_idle_ttl: Duration::from_secs(config.mcp.session.idle_ttl_seconds.max(1)),
         session_gc_interval: Duration::from_secs(config.mcp.session.gc_interval_seconds.max(1)),
