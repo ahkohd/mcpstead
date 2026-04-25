@@ -1,0 +1,26 @@
+{
+  "name": "@ahkohd/mcpstead-linux-x64-gnu",
+  "version": "0.1.0",
+  "description": "Prebuilt binaries for @ahkohd/mcpstead (linux x64 glibc)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ahkohd/mcpstead.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "files": [
+    "bin/mcpstead"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

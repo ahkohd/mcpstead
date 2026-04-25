@@ -1,0 +1,23 @@
+{
+  "name": "@ahkohd/mcpstead-win32-x64-msvc",
+  "version": "0.1.0",
+  "description": "Prebuilt binaries for @ahkohd/mcpstead (win32 x64 msvc)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ahkohd/mcpstead.git"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/mcpstead.exe"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

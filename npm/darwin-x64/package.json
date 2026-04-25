@@ -1,0 +1,23 @@
+{
+  "name": "@ahkohd/mcpstead-darwin-x64",
+  "version": "0.1.0",
+  "description": "Prebuilt binaries for @ahkohd/mcpstead (darwin x64)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ahkohd/mcpstead.git"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/mcpstead"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

@@ -1,0 +1,425 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      dry_run:
+        description: "Dry run (no publish, no push)"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  HOMEBREW_TAP_REPO: ahkohd/tap
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    outputs:
+      version: ${{ steps.version.outputs.new }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Quality gates
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo build --workspace --bins
+          cargo test --workspace --all-targets
+
+      - name: Calculate version
+        id: version
+        run: |
+          current=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            new="${GITHUB_REF_NAME#v}"
+            echo "current=$current" >> "$GITHUB_OUTPUT"
+            echo "new=$new" >> "$GITHUB_OUTPUT"
+            echo "Using tag version $new"
+            exit 0
+          fi
+
+          IFS='.' read -r major minor patch <<< "$current"
+          case "${{ inputs.bump_type }}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+
+          new="${major}.${minor}.${patch}"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "Bumping $current -> $new"
+
+      - name: Validate tag version
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          VERSION="${{ steps.version.outputs.new }}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "tag v${VERSION} does not match Cargo.toml version ${CARGO_VERSION}" >&2
+            exit 1
+          fi
+          node scripts/sync-npm-version.cjs "$VERSION"
+          if ! git diff --exit-code package.json npm/darwin-arm64/package.json npm/darwin-x64/package.json npm/linux-x64-gnu/package.json npm/win32-x64-msvc/package.json; then
+            echo "npm package versions are not synced with Cargo.toml" >&2
+            exit 1
+          fi
+
+      - name: Update Cargo version
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.new }}"
+          perl -0777 -i -pe 's/^version = ".*"/version = "'"$NEW_VERSION"'"/m' Cargo.toml
+          cargo update --workspace
+
+      - name: Update npm package versions
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: node scripts/sync-npm-version.cjs "${{ steps.version.outputs.new }}"
+
+      - name: npm package dry run
+        run: npm pack --dry-run
+
+      - name: Configure git
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit and tag
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          git add Cargo.toml Cargo.lock
+          git add package.json
+          git add npm/darwin-arm64/package.json npm/darwin-x64/package.json npm/linux-x64-gnu/package.json npm/win32-x64-msvc/package.json
+          git commit -m "chore: release v${{ steps.version.outputs.new }}"
+          git tag "v${{ steps.version.outputs.new }}"
+          git push origin "HEAD:${BRANCH}"
+          git push origin "v${{ steps.version.outputs.new }}"
+
+      - name: Publish crate
+        if: ${{ !inputs.dry_run }}
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for crates.io index
+        if: ${{ !inputs.dry_run }}
+        run: sleep 30
+
+      - name: Dry run summary
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          echo "## Dry Run Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Current version: ${{ steps.version.outputs.current }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- New version: ${{ steps.version.outputs.new }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Would commit, tag, and push v${{ steps.version.outputs.new }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Would publish mcpstead crate to crates.io" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Would build release artifacts for macOS, Linux, and Windows" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Would publish npm packages:" >> "$GITHUB_STEP_SUMMARY"
+          echo "  - @ahkohd/mcpstead-darwin-arm64@${{ steps.version.outputs.new }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "  - @ahkohd/mcpstead-darwin-x64@${{ steps.version.outputs.new }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "  - @ahkohd/mcpstead-linux-x64-gnu@${{ steps.version.outputs.new }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "  - @ahkohd/mcpstead-win32-x64-msvc@${{ steps.version.outputs.new }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "  - @ahkohd/mcpstead@${{ steps.version.outputs.new }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Would create GitHub Release v${{ steps.version.outputs.new }}" >> "$GITHUB_STEP_SUMMARY"
+          cargo publish --dry-run --allow-dirty --locked
+          npm publish --dry-run --access public
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: release
+    if: ${{ !inputs.dry_run }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-15
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: v${{ needs.release.outputs.version }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --bin mcpstead --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: ${{ matrix.os != 'windows-latest' }}
+        run: |
+          tar -czvf mcpstead-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release mcpstead
+
+      - name: Package (windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          tar -czvf mcpstead-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release mcpstead.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mcpstead-${{ matrix.target }}
+          path: mcpstead-${{ matrix.target }}.tar.gz
+
+  publish-npm:
+    name: Publish npm packages
+    needs: [release, build]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: v${{ needs.release.outputs.version }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Stage npm packages
+        run: |
+          STAGE_DIR="${RUNNER_TEMP}/mcpstead-npm"
+          rm -rf "${STAGE_DIR}"
+          mkdir -p "${STAGE_DIR}"
+
+          mkdir -p "${STAGE_DIR}/main"
+          cp -R package.json README.md bin lib "${STAGE_DIR}/main"
+
+          mkdir -p "${STAGE_DIR}/darwin-arm64"
+          cp -R npm/darwin-arm64/. "${STAGE_DIR}/darwin-arm64"
+          rm -f "${STAGE_DIR}/darwin-arm64/bin/.gitkeep"
+          tar -xzf artifacts/mcpstead-aarch64-apple-darwin.tar.gz -C "${STAGE_DIR}/darwin-arm64/bin"
+          chmod +x "${STAGE_DIR}/darwin-arm64/bin/mcpstead"
+
+          mkdir -p "${STAGE_DIR}/darwin-x64"
+          cp -R npm/darwin-x64/. "${STAGE_DIR}/darwin-x64"
+          rm -f "${STAGE_DIR}/darwin-x64/bin/.gitkeep"
+          tar -xzf artifacts/mcpstead-x86_64-apple-darwin.tar.gz -C "${STAGE_DIR}/darwin-x64/bin"
+          chmod +x "${STAGE_DIR}/darwin-x64/bin/mcpstead"
+
+          mkdir -p "${STAGE_DIR}/linux-x64-gnu"
+          cp -R npm/linux-x64-gnu/. "${STAGE_DIR}/linux-x64-gnu"
+          rm -f "${STAGE_DIR}/linux-x64-gnu/bin/.gitkeep"
+          tar -xzf artifacts/mcpstead-x86_64-unknown-linux-gnu.tar.gz -C "${STAGE_DIR}/linux-x64-gnu/bin"
+          chmod +x "${STAGE_DIR}/linux-x64-gnu/bin/mcpstead"
+
+          mkdir -p "${STAGE_DIR}/win32-x64-msvc"
+          cp -R npm/win32-x64-msvc/. "${STAGE_DIR}/win32-x64-msvc"
+          rm -f "${STAGE_DIR}/win32-x64-msvc/bin/.gitkeep"
+          tar -xzf artifacts/mcpstead-x86_64-pc-windows-msvc.tar.gz -C "${STAGE_DIR}/win32-x64-msvc/bin"
+
+          echo "STAGE_DIR=${STAGE_DIR}" >> "$GITHUB_ENV"
+
+      - name: Verify npm auth
+        run: npm whoami
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish platform packages
+        run: |
+          npm publish "${STAGE_DIR}/darwin-arm64" --provenance --access public
+          npm publish "${STAGE_DIR}/darwin-x64" --provenance --access public
+          npm publish "${STAGE_DIR}/linux-x64-gnu" --provenance --access public
+          npm publish "${STAGE_DIR}/win32-x64-msvc" --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Wait for npm index
+        run: sleep 15
+
+      - name: Publish main package
+        run: npm publish "${STAGE_DIR}/main" --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish:
+    name: Publish Release
+    needs: [release, build]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.release.outputs.version }}
+          generate_release_notes: true
+          files: artifacts/*
+
+  update-homebrew:
+    name: Update Homebrew Tap
+    needs: [release, publish]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check deploy key and tap repo
+        id: tap
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          if [ -z "${TAP_DEPLOY_KEY}" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "reason=missing_key" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${TAP_DEPLOY_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          if git ls-remote "git@github.com:${HOMEBREW_TAP_REPO}.git" >/dev/null 2>&1; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "reason=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "reason=missing_repo" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip summary
+        if: ${{ steps.tap.outputs.ready != 'true' }}
+        run: |
+          if [ "${{ steps.tap.outputs.reason }}" = "missing_key" ]; then
+            echo "- Homebrew update skipped (missing HOMEBREW_TAP_DEPLOY_KEY secret)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Homebrew update skipped (missing repo ${HOMEBREW_TAP_REPO})" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Download artifacts
+        if: ${{ steps.tap.outputs.ready == 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute SHA256
+        if: ${{ steps.tap.outputs.ready == 'true' }}
+        id: sha
+        run: |
+          echo "macos_arm64=$(shasum -a 256 artifacts/mcpstead-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "macos_x86_64=$(shasum -a 256 artifacts/mcpstead-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_x86_64=$(shasum -a 256 artifacts/mcpstead-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Update formula
+        if: ${{ steps.tap.outputs.ready == 'true' }}
+        run: |
+          VERSION="${{ needs.release.outputs.version }}"
+          SHA_MACOS_ARM64="${{ steps.sha.outputs.macos_arm64 }}"
+          SHA_MACOS_X86_64="${{ steps.sha.outputs.macos_x86_64 }}"
+          SHA_LINUX_X86_64="${{ steps.sha.outputs.linux_x86_64 }}"
+
+          git clone "git@github.com:${HOMEBREW_TAP_REPO}.git"
+          cd "${HOMEBREW_TAP_REPO##*/}"
+
+          mkdir -p Formula
+          cat > Formula/mcpstead.rb << 'FORMULA'
+          class Mcpstead < Formula
+            desc "MCP gateway"
+            homepage "https://github.com/ahkohd/mcpstead"
+            version "VERSION_PLACEHOLDER"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/ahkohd/mcpstead/releases/download/vVERSION_PLACEHOLDER/mcpstead-aarch64-apple-darwin.tar.gz"
+                sha256 "SHA_MACOS_ARM64_PLACEHOLDER"
+              end
+              on_intel do
+                url "https://github.com/ahkohd/mcpstead/releases/download/vVERSION_PLACEHOLDER/mcpstead-x86_64-apple-darwin.tar.gz"
+                sha256 "SHA_MACOS_X86_64_PLACEHOLDER"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/ahkohd/mcpstead/releases/download/vVERSION_PLACEHOLDER/mcpstead-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_LINUX_X86_64_PLACEHOLDER"
+              end
+            end
+
+            def install
+              bin.install "mcpstead"
+            end
+
+            test do
+              system "#{bin}/mcpstead", "--version"
+            end
+          end
+          FORMULA
+
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" Formula/mcpstead.rb
+          sed -i "s/SHA_MACOS_ARM64_PLACEHOLDER/${SHA_MACOS_ARM64}/g" Formula/mcpstead.rb
+          sed -i "s/SHA_MACOS_X86_64_PLACEHOLDER/${SHA_MACOS_X86_64}/g" Formula/mcpstead.rb
+          sed -i "s/SHA_LINUX_X86_64_PLACEHOLDER/${SHA_LINUX_X86_64}/g" Formula/mcpstead.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/mcpstead.rb
+          git commit -m "mcpstead ${VERSION}"
+          git push

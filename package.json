@@ -1,0 +1,40 @@
+{
+  "name": "@ahkohd/mcpstead",
+  "version": "0.1.0",
+  "description": "MCP gateway",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ahkohd/mcpstead.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ahkohd/mcpstead/issues"
+  },
+  "homepage": "https://github.com/ahkohd/mcpstead#readme",
+  "type": "commonjs",
+  "bin": {
+    "mcpstead": "bin/mcpstead.js"
+  },
+  "files": [
+    "bin/*.js",
+    "lib/*.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@ahkohd/mcpstead-darwin-arm64": "0.1.0",
+    "@ahkohd/mcpstead-darwin-x64": "0.1.0",
+    "@ahkohd/mcpstead-linux-x64-gnu": "0.1.0",
+    "@ahkohd/mcpstead-win32-x64-msvc": "0.1.0"
+  },
+  "scripts": {
+    "pack:dry": "npm pack --dry-run",
+    "version:sync": "node scripts/sync-npm-version.cjs"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
