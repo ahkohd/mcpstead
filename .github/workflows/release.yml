@@ -1,9 +1,6 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       bump_type:
@@ -63,16 +60,8 @@ jobs:
         id: version
         run: |
           current=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
-
-          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-            new="${GITHUB_REF_NAME#v}"
-            echo "current=$current" >> "$GITHUB_OUTPUT"
-            echo "new=$new" >> "$GITHUB_OUTPUT"
-            echo "Using tag version $new"
-            exit 0
-          fi
-
           IFS='.' read -r major minor patch <<< "$current"
+
           case "${{ inputs.bump_type }}" in
             major) major=$((major + 1)); minor=0; patch=0 ;;
             minor) minor=$((minor + 1)); patch=0 ;;
@@ -84,43 +73,26 @@ jobs:
           echo "new=$new" >> "$GITHUB_OUTPUT"
           echo "Bumping $current -> $new"
 
-      - name: Validate tag version
-        if: ${{ github.event_name == 'push' }}
-        run: |
-          VERSION="${{ steps.version.outputs.new }}"
-          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
-          if [ "$VERSION" != "$CARGO_VERSION" ]; then
-            echo "tag v${VERSION} does not match Cargo.toml version ${CARGO_VERSION}" >&2
-            exit 1
-          fi
-          node scripts/sync-npm-version.cjs "$VERSION"
-          if ! git diff --exit-code package.json npm/darwin-arm64/package.json npm/darwin-x64/package.json npm/linux-x64-gnu/package.json npm/win32-x64-msvc/package.json; then
-            echo "npm package versions are not synced with Cargo.toml" >&2
-            exit 1
-          fi
-
       - name: Update Cargo version
-        if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           NEW_VERSION="${{ steps.version.outputs.new }}"
           perl -0777 -i -pe 's/^version = ".*"/version = "'"$NEW_VERSION"'"/m' Cargo.toml
           cargo update --workspace
 
       - name: Update npm package versions
-        if: ${{ github.event_name == 'workflow_dispatch' }}
         run: node scripts/sync-npm-version.cjs "${{ steps.version.outputs.new }}"
 
       - name: npm package dry run
         run: npm pack --dry-run
 
       - name: Configure git
-        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
+        if: ${{ !inputs.dry_run }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Commit and tag
-        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
+        if: ${{ !inputs.dry_run }}
         run: |
           BRANCH="${GITHUB_REF_NAME}"
           git add Cargo.toml Cargo.lock
@@ -132,17 +104,17 @@ jobs:
           git push origin "v${{ steps.version.outputs.new }}"
 
       - name: Publish crate
-        if: ${{ github.event_name == 'push' }}
+        if: ${{ !inputs.dry_run }}
         run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       - name: Wait for crates.io index
-        if: ${{ github.event_name == 'push' }}
+        if: ${{ !inputs.dry_run }}
         run: sleep 30
 
       - name: Dry run summary
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        if: ${{ inputs.dry_run }}
         run: |
           echo "## Dry Run Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "- Current version: ${{ steps.version.outputs.current }}" >> "$GITHUB_STEP_SUMMARY"
@@ -163,7 +135,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     needs: release
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ !inputs.dry_run }}
     strategy:
       matrix:
         include:
@@ -209,7 +181,7 @@ jobs:
   publish-npm:
     name: Publish npm packages
     needs: [release, build]
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -291,7 +263,7 @@ jobs:
   publish:
     name: Publish Release
     needs: [release, build]
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -313,7 +285,7 @@ jobs:
   update-homebrew:
     name: Update Homebrew Tap
     needs: [release, publish]
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
 
     steps:
