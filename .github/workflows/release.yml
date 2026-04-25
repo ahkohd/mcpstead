@@ -132,13 +132,13 @@ jobs:
           git push origin "v${{ steps.version.outputs.new }}"
 
       - name: Publish crate
-        if: ${{ !inputs.dry_run }}
+        if: ${{ github.event_name == 'push' }}
         run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       - name: Wait for crates.io index
-        if: ${{ !inputs.dry_run }}
+        if: ${{ github.event_name == 'push' }}
         run: sleep 30
 
       - name: Dry run summary
@@ -163,7 +163,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     needs: release
-    if: ${{ !inputs.dry_run }}
+    if: ${{ github.event_name == 'push' }}
     strategy:
       matrix:
         include:
@@ -209,7 +209,7 @@ jobs:
   publish-npm:
     name: Publish npm packages
     needs: [release, build]
-    if: ${{ !inputs.dry_run }}
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -291,7 +291,7 @@ jobs:
   publish:
     name: Publish Release
     needs: [release, build]
-    if: ${{ !inputs.dry_run }}
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -313,7 +313,7 @@ jobs:
   update-homebrew:
     name: Update Homebrew Tap
     needs: [release, publish]
-    if: ${{ !inputs.dry_run }}
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
 
     steps:
