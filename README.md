@@ -162,6 +162,10 @@ port: 8766
 mcp:
   auth:
     mode: none           # none | bearer
+  session:
+    idle_ttl_seconds: 3600
+    gc_interval_seconds: 60
+    shutdown_grace_seconds: 5
 
 servers:
   - name: local
@@ -187,6 +191,12 @@ logging:
   level: info
 ```
 
+### MCP session config keys
+
+- `mcp.session.idle_ttl_seconds` - evict inactive sessions after this many seconds (default `3600`)
+- `mcp.session.gc_interval_seconds` - idle-session GC wake interval (default `60`)
+- `mcp.session.shutdown_grace_seconds` - max shutdown accounting sweep time (default `5`)
+
 ### Per-upstream config keys
 
 - `name` - required, used as tool prefix
@@ -203,19 +213,48 @@ logging:
 
 ## Observability
 
+Metrics label cardinality assumes a small bounded set of upstreams and tools. Tool-call series are keyed by `(server, tool)`.
+
 ### Metrics
 
-`/metrics` exposes Prometheus-format counters and gauges:
+`/metrics` exposes Prometheus-format counters, gauges, and histograms:
 
 ```
+mcpstead_build_info{version="...",rust_version="...",git_sha="..."}
+mcpstead_start_time_seconds
+mcpstead_uptime_seconds
+mcpstead_process_resident_memory_bytes
+mcpstead_process_virtual_memory_bytes
+mcpstead_process_cpu_seconds_total
+mcpstead_process_open_fds
+mcpstead_process_max_fds
+mcpstead_process_threads
 mcpstead_upstream_connected{server="..."}
 mcpstead_upstream_tools_count{server="..."}
 mcpstead_upstream_reconnects_total{server="..."}
 mcpstead_upstream_last_seen_seconds{server="..."}
+mcpstead_upstream_initialize_total{server="...",result="success|error"}
+mcpstead_upstream_initialize_duration_seconds_bucket{server="...",le="..."}
+mcpstead_upstream_health_checks_total{server="...",result="success|failure"}
+mcpstead_upstream_reconnect_attempts_total{server="...",result="success|error"}
+mcpstead_upstream_backoff_seconds_total{server="..."}
+mcpstead_upstream_in_backoff{server="..."}
+mcpstead_upstream_current_backoff_seconds{server="..."}
+mcpstead_upstream_tools_refresh_total{server="...",result="success|error"}
+mcpstead_upstream_tools_refresh_duration_seconds_bucket{server="...",le="..."}
+mcpstead_upstream_tools_last_refresh_timestamp_seconds{server="..."}
+mcpstead_upstream_bytes_total{server="...",direction="sent|received"}
 mcpstead_downstream_sessions_active
+mcpstead_downstream_sessions_total
+mcpstead_downstream_session_duration_seconds_bucket{le="..."}
+mcpstead_downstream_session_terminations_total{reason="..."}
+mcpstead_mcp_requests_total{method="...",result="success|error"}
+mcpstead_mcp_request_duration_seconds_bucket{method="...",le="..."}
+mcpstead_mcp_auth_attempts_total{result="success|failure"}
+mcpstead_mcp_auth_failures_total{reason="..."}
 mcpstead_tool_calls_total{server="...",tool="..."}
-mcpstead_tool_call_errors_total{server="...",tool="..."}
-mcpstead_tool_call_duration_seconds_sum{server="...",tool="..."}
+mcpstead_tool_call_errors_total{server="...",tool="...",reason="..."}
+mcpstead_tool_call_duration_seconds_bucket{server="...",tool="...",le="..."}
 ```
 
 ### Scrape config

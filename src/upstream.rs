@@ -42,6 +42,10 @@ pub(crate) async fn manage_server(state: AppState, name: String) {
 
         match result {
             Ok((next_session_id, tools)) => {
+                if failures > 0 {
+                    record_upstream_reconnect_attempt(&state, &name, "success").await;
+                }
+                record_upstream_health_check(&state, &name, "success").await;
                 failures = 0;
                 if next_session_id.is_some() {
                     session_id = next_session_id;
@@ -51,6 +55,8 @@ pub(crate) async fn manage_server(state: AppState, name: String) {
                 tokio::time::sleep(Duration::from_secs(config.tools.ttl_seconds.max(1))).await;
             }
             Err(err) => {
+                record_upstream_reconnect_attempt(&state, &name, "error").await;
+                record_upstream_health_check(&state, &name, "failure").await;
                 failures = failures.saturating_add(1);
                 session_id = None;
                 set_server_disconnected(&state, &name, err.to_string()).await;
@@ -62,7 +68,10 @@ pub(crate) async fn manage_server(state: AppState, name: String) {
                 } else {
                     warn!(server = %name, failures, error = %err, "upstream unavailable");
                 }
-                tokio::time::sleep(backoff_delay(&config.reconnect, failures)).await;
+                let delay = backoff_delay(&config.reconnect, failures);
+                record_upstream_backoff_start(&state, &name, delay.as_secs_f64()).await;
+                tokio::time::sleep(delay).await;
+                record_upstream_backoff_complete(&state, &name, delay.as_secs_f64()).await;
             }
         }
     }
@@ -116,6 +125,46 @@ async fn set_server_disconnected(state: &AppState, name: &str, error: String) {
     }
 }
 
+async fn record_upstream_health_check(state: &AppState, server: &str, result: &str) {
+    state
+        .metrics
+        .lock()
+        .await
+        .record_upstream_health_check(server, result);
+}
+
+async fn record_upstream_reconnect_attempt(state: &AppState, server: &str, result: &str) {
+    state
+        .metrics
+        .lock()
+        .await
+        .record_upstream_reconnect_attempt(server, result);
+}
+
+async fn record_upstream_backoff_start(state: &AppState, server: &str, seconds: f64) {
+    state
+        .metrics
+        .lock()
+        .await
+        .set_upstream_backoff(server, seconds);
+}
+
+async fn record_upstream_backoff_complete(state: &AppState, server: &str, seconds: f64) {
+    state
+        .metrics
+        .lock()
+        .await
+        .record_upstream_backoff_complete(server, seconds);
+}
+
+async fn record_upstream_bytes(state: &AppState, server: &str, direction: &str, bytes: u64) {
+    state
+        .metrics
+        .lock()
+        .await
+        .record_upstream_bytes(server, direction, bytes);
+}
+
 fn upstream_client<'a>(state: &'a AppState, config: &ServerConfig) -> &'a Client {
     if config.tls_skip_verify {
         &state.insecure_client
@@ -136,8 +185,26 @@ async fn initialize_and_load_tools(
             "version": env!("CARGO_PKG_VERSION")
         }
     });
-    let (session_id, _) =
-        upstream_request(state, config, None, json!(1), "initialize", params).await?;
+    let started = Instant::now();
+    let initialize = upstream_request(state, config, None, json!(1), "initialize", params).await;
+    let duration = started.elapsed().as_secs_f64();
+    match &initialize {
+        Ok(_) => {
+            state
+                .metrics
+                .lock()
+                .await
+                .record_upstream_initialize(&config.name, "success", duration)
+        }
+        Err(_) => {
+            state
+                .metrics
+                .lock()
+                .await
+                .record_upstream_initialize(&config.name, "error", duration)
+        }
+    }
+    let (session_id, _) = initialize?;
     let _ = upstream_notification(
         state,
         config,
@@ -154,18 +221,42 @@ async fn load_tools(
     config: &ServerConfig,
     session_id: Option<&str>,
 ) -> Result<(Option<String>, Vec<Value>)> {
-    let (next_session_id, result) =
-        upstream_request(state, config, session_id, json!(2), "tools/list", json!({})).await?;
-    let tools = result
-        .get("tools")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or_else(|| {
-            anyhow!(
+    let started = Instant::now();
+    let refresh =
+        upstream_request(state, config, session_id, json!(2), "tools/list", json!({})).await;
+    let duration = started.elapsed().as_secs_f64();
+    let (next_session_id, result) = match refresh {
+        Ok(value) => value,
+        Err(err) => {
+            state.metrics.lock().await.record_upstream_tools_refresh(
+                &config.name,
+                "error",
+                duration,
+            );
+            return Err(err);
+        }
+    };
+    let tools = match result.get("tools").and_then(Value::as_array).cloned() {
+        Some(tools) => {
+            state.metrics.lock().await.record_upstream_tools_refresh(
+                &config.name,
+                "success",
+                duration,
+            );
+            tools
+        }
+        None => {
+            state.metrics.lock().await.record_upstream_tools_refresh(
+                &config.name,
+                "error",
+                duration,
+            );
+            return Err(anyhow!(
                 "upstream '{}' tools/list returned no tools array",
                 config.name
-            )
-        })?;
+            ));
+        }
+    };
     Ok((
         next_session_id.or_else(|| session_id.map(ToOwned::to_owned)),
         tools,
@@ -222,11 +313,13 @@ async fn send_upstream_body(
     body: Value,
 ) -> Result<(Option<String>, Option<Value>)> {
     let client = upstream_client(state, config);
+    let body_bytes = serde_json::to_vec(&body).context("serialize upstream request body")?;
+    record_upstream_bytes(state, &config.name, "sent", body_bytes.len() as u64).await;
     let mut request = client
         .post(&config.url)
         .header(CONTENT_TYPE.as_str(), "application/json")
         .header(ACCEPT.as_str(), config.accept_header())
-        .json(&body);
+        .body(body_bytes);
 
     if let Some(session_id) = session_id {
         request = request.header(MCP_SESSION_ID, session_id);
@@ -244,10 +337,11 @@ async fn send_upstream_body(
         .send()
         .await
         .with_context(|| format!("upstream '{}' request failed", config.name))?;
-    parse_upstream_response(config, response).await
+    parse_upstream_response(state, config, response).await
 }
 
 async fn parse_upstream_response(
+    state: &AppState,
     config: &ServerConfig,
     response: reqwest::Response,
 ) -> Result<(Option<String>, Option<Value>)> {
@@ -262,6 +356,7 @@ async fn parse_upstream_response(
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
     let bytes = response.bytes().await?;
+    record_upstream_bytes(state, &config.name, "received", bytes.len() as u64).await;
 
     if status == StatusCode::ACCEPTED && bytes.is_empty() {
         return Ok((session_id, None));

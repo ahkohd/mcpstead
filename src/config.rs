@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use tracing::warn;
 
 const DEFAULT_ACCEPT: &str = "application/json, text/event-stream";
 
@@ -37,6 +38,7 @@ impl Default for Config {
 #[serde(default)]
 pub(crate) struct McpConfig {
     pub(crate) auth: McpAuthConfig,
+    pub(crate) session: McpSessionConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +46,24 @@ pub(crate) struct McpConfig {
 pub(crate) struct McpAuthConfig {
     pub(crate) mode: McpAuthMode,
     pub(crate) bearer_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub(crate) struct McpSessionConfig {
+    pub(crate) idle_ttl_seconds: u64,
+    pub(crate) gc_interval_seconds: u64,
+    pub(crate) shutdown_grace_seconds: u64,
+}
+
+impl Default for McpSessionConfig {
+    fn default() -> Self {
+        Self {
+            idle_ttl_seconds: 3600,
+            gc_interval_seconds: 60,
+            shutdown_grace_seconds: 5,
+        }
+    }
 }
 
 impl Default for McpAuthConfig {
@@ -217,6 +237,22 @@ pub(crate) fn validate_config(config: &Config) -> Result<()> {
     if config.mcp.auth.bearer_token.is_some() {
         bail!("mcp.auth.bearer_token is not allowed; use MCPSTEAD_BEARER_TOKEN");
     }
+    if config.mcp.session.idle_ttl_seconds == 0 {
+        bail!("mcp.session.idle_ttl_seconds must be greater than 0");
+    }
+    if config.mcp.session.gc_interval_seconds == 0 {
+        bail!("mcp.session.gc_interval_seconds must be greater than 0");
+    }
+    if config.mcp.session.shutdown_grace_seconds == 0 {
+        bail!("mcp.session.shutdown_grace_seconds must be greater than 0");
+    }
+    if config.mcp.session.gc_interval_seconds > config.mcp.session.idle_ttl_seconds {
+        warn!(
+            idle_ttl_seconds = config.mcp.session.idle_ttl_seconds,
+            gc_interval_seconds = config.mcp.session.gc_interval_seconds,
+            "mcp.session.gc_interval_seconds is greater than idle_ttl_seconds; idle sessions may live past ttl"
+        );
+    }
 
     let mut names = HashSet::new();
     for server in &config.servers {
@@ -265,6 +301,31 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("mcp.auth.bearer_token is not allowed")
+        );
+    }
+
+    #[test]
+    fn session_config_defaults() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(config.mcp.session.idle_ttl_seconds, 3600);
+        assert_eq!(config.mcp.session.gc_interval_seconds, 60);
+        assert_eq!(config.mcp.session.shutdown_grace_seconds, 5);
+    }
+
+    #[test]
+    fn rejects_zero_session_durations() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+            mcp:
+              session:
+                idle_ttl_seconds: 0
+            "#,
+        )
+        .unwrap();
+        let err = validate_config(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mcp.session.idle_ttl_seconds must be greater than 0")
         );
     }
 }

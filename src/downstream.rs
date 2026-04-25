@@ -15,7 +15,9 @@ use uuid::Uuid;
 
 use crate::config::{McpAuthMode, ServerConfig};
 use crate::constants::MCP_SESSION_ID;
-use crate::state::AppState;
+use crate::state::{
+    AppState, DownstreamSession, accepting_new_sessions, terminate_session, touch_session,
+};
 use crate::upstream::upstream_request;
 
 const JSONRPC_PARSE_ERROR: i64 = -32700;
@@ -31,19 +33,45 @@ fn get_header(headers: &HeaderMap, key: &str) -> Option<String> {
         .map(|value| value.trim().to_string())
 }
 
-fn is_mcp_authorized(headers: &HeaderMap, state: &AppState) -> bool {
+#[derive(Clone, Copy)]
+enum AuthDecision {
+    Allow,
+    Deny(&'static str),
+}
+
+fn authorize_mcp(headers: &HeaderMap, state: &AppState) -> AuthDecision {
     match state.mcp_auth_mode {
-        McpAuthMode::None => true,
+        McpAuthMode::None => AuthDecision::Allow,
         McpAuthMode::Bearer => {
             let Some(token) = &state.mcp_bearer_token else {
-                return false;
+                return AuthDecision::Deny("internal");
             };
             let Some(auth) = get_header(headers, "authorization") else {
-                return false;
+                return AuthDecision::Deny("missing_header");
             };
-            let expected = format!("Bearer {token}");
-            bool::from(auth.as_bytes().ct_eq(expected.as_bytes()))
+            let Some(candidate) = auth.strip_prefix("Bearer ") else {
+                return AuthDecision::Deny("bad_format");
+            };
+            if candidate.is_empty() {
+                return AuthDecision::Deny("bad_format");
+            }
+            if bool::from(candidate.as_bytes().ct_eq(token.as_bytes())) {
+                AuthDecision::Allow
+            } else {
+                AuthDecision::Deny("wrong_token")
+            }
         }
+    }
+}
+
+async fn record_auth_decision(state: &AppState, decision: AuthDecision) {
+    if state.mcp_auth_mode != McpAuthMode::Bearer {
+        return;
+    }
+    let mut metrics = state.metrics.lock().await;
+    match decision {
+        AuthDecision::Allow => metrics.record_auth_success(),
+        AuthDecision::Deny(reason) => metrics.record_auth_failure(reason),
     }
 }
 
@@ -60,13 +88,34 @@ pub(crate) async fn post_mcp(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !is_mcp_authorized(&headers, &state) {
+    let request_started = Instant::now();
+    let auth = authorize_mcp(&headers, &state);
+    record_auth_decision(&state, auth).await;
+    if let AuthDecision::Deny(_) = auth {
+        record_mcp_request(
+            &state,
+            "unknown",
+            "error",
+            request_started.elapsed().as_secs_f64(),
+        )
+        .await;
         return unauthorized_response();
+    }
+
+    if let Some(session_id) = get_header(&headers, MCP_SESSION_ID) {
+        touch_session(&state, &session_id).await;
     }
 
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(err) => {
+            record_mcp_request(
+                &state,
+                "invalid",
+                "error",
+                request_started.elapsed().as_secs_f64(),
+            )
+            .await;
             return downstream_response(
                 &headers,
                 StatusCode::OK,
@@ -81,30 +130,113 @@ pub(crate) async fn post_mcp(
     };
 
     let saw_initialize = value_has_method(&value, "initialize");
-    let session_id = saw_initialize.then(|| Uuid::new_v4().to_string());
-    if let Some(session_id) = &session_id {
-        state.sessions.write().await.insert(session_id.clone());
+    if saw_initialize && !accepting_new_sessions(&state) {
+        record_mcp_request(
+            &state,
+            "initialize",
+            "error",
+            request_started.elapsed().as_secs_f64(),
+        )
+        .await;
+        return (StatusCode::SERVICE_UNAVAILABLE, "gateway shutting down").into_response();
     }
 
+    let session_id = saw_initialize.then(|| Uuid::new_v4().to_string());
+    if let Some(session_id) = &session_id {
+        let now = Instant::now();
+        state.sessions.write().await.insert(
+            session_id.clone(),
+            DownstreamSession {
+                created_at: now,
+                last_activity: now,
+            },
+        );
+        state.metrics.lock().await.record_session_opened();
+    }
+
+    let mut response_session_id = session_id.clone();
     let response = if let Some(items) = value.as_array() {
         let mut responses = Vec::new();
         for item in items {
-            if let Some(response) = handle_message(&state, item.clone()).await {
+            if let Some(response) = handle_message_with_metrics(&state, item.clone()).await {
                 responses.push(response);
             }
         }
         if responses.is_empty() {
-            return downstream_response(&headers, StatusCode::ACCEPTED, None, session_id);
+            if let Some(session_id) = &session_id {
+                terminate_session(&state, session_id, "init_failed").await;
+                response_session_id = None;
+            }
+            return downstream_response(&headers, StatusCode::ACCEPTED, None, response_session_id);
         }
         Value::Array(responses)
     } else {
-        match handle_message(&state, value).await {
+        match handle_message_with_metrics(&state, value).await {
             Some(response) => response,
-            None => return downstream_response(&headers, StatusCode::ACCEPTED, None, session_id),
+            None => {
+                if let Some(session_id) = &session_id {
+                    terminate_session(&state, session_id, "init_failed").await;
+                    response_session_id = None;
+                }
+                return downstream_response(
+                    &headers,
+                    StatusCode::ACCEPTED,
+                    None,
+                    response_session_id,
+                );
+            }
         }
     };
 
-    downstream_response(&headers, StatusCode::OK, Some(response), session_id)
+    if let Some(session_id) = &session_id
+        && !initialize_response_succeeded(&response)
+    {
+        terminate_session(&state, session_id, "init_failed").await;
+        response_session_id = None;
+    }
+
+    downstream_response(
+        &headers,
+        StatusCode::OK,
+        Some(response),
+        response_session_id,
+    )
+}
+
+async fn handle_message_with_metrics(state: &AppState, message: Value) -> Option<Value> {
+    let method = method_label(&message);
+    let started = Instant::now();
+    let response = handle_message(state, message).await;
+    let result = if response.as_ref().is_some_and(is_json_rpc_error) {
+        "error"
+    } else {
+        "success"
+    };
+    record_mcp_request(state, method, result, started.elapsed().as_secs_f64()).await;
+    response
+}
+
+async fn record_mcp_request(state: &AppState, method: &str, result: &str, duration: f64) {
+    state
+        .metrics
+        .lock()
+        .await
+        .record_mcp_request(method, result, duration);
+}
+
+fn method_label(message: &Value) -> &'static str {
+    match message.get("method").and_then(Value::as_str) {
+        Some("initialize") => "initialize",
+        Some("notifications/initialized") => "notifications/initialized",
+        Some("tools/list") => "tools/list",
+        Some("tools/call") => "tools/call",
+        Some(_) => "unknown",
+        None => "invalid",
+    }
+}
+
+fn is_json_rpc_error(value: &Value) -> bool {
+    value.get("error").is_some()
 }
 
 async fn handle_message(state: &AppState, message: Value) -> Option<Value> {
@@ -276,6 +408,14 @@ async fn call_tool(state: &AppState, response_id: Value, message: &Value) -> Val
     };
 
     if !connected {
+        record_tool_call(
+            state,
+            server_name,
+            tool_name,
+            0.0,
+            Some("upstream_disconnected"),
+        )
+        .await;
         return json_rpc_error(
             response_id,
             JSONRPC_UPSTREAM_ERROR,
@@ -300,14 +440,46 @@ async fn call_tool(state: &AppState, response_id: Value, message: &Value) -> Val
 
     match result {
         Ok((_next_session_id, result)) => {
-            record_tool_call(state, server_name, tool_name, duration, false).await;
+            let error_reason =
+                upstream_tool_returned_error(&result).then_some("upstream_returned_error");
+            record_tool_call(state, server_name, tool_name, duration, error_reason).await;
             mark_server_seen(state, server_name).await;
             json_rpc_result(response_id, result)
         }
         Err(err) => {
-            record_tool_call(state, server_name, tool_name, duration, true).await;
+            let reason = categorize_tool_error(&err.to_string());
+            record_tool_call(state, server_name, tool_name, duration, Some(reason)).await;
             json_rpc_error(response_id, JSONRPC_UPSTREAM_ERROR, err.to_string())
         }
+    }
+}
+
+fn upstream_tool_returned_error(result: &Value) -> bool {
+    result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn categorize_tool_error(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("timeout") || error.contains("timed out") {
+        "upstream_timeout"
+    } else if error.contains("http 401")
+        || error.contains("http 403")
+        || error.contains("unauthorized")
+    {
+        "upstream_auth_failed"
+    } else if error.contains("json-rpc error")
+        || error.contains("not valid json")
+        || error.contains("sse")
+        || error.contains("request failed")
+        || error.contains("connection")
+        || error.contains("http")
+    {
+        "upstream_protocol_error"
+    } else {
+        "internal"
     }
 }
 
@@ -336,18 +508,13 @@ async fn record_tool_call(
     server_name: &str,
     tool_name: &str,
     duration: f64,
-    error: bool,
+    error_reason: Option<&str>,
 ) {
-    let mut metrics = state.metrics.lock().await;
-    let metric = metrics
-        .tool_calls
-        .entry((server_name.to_string(), tool_name.to_string()))
-        .or_default();
-    metric.count = metric.count.saturating_add(1);
-    metric.duration_sum_seconds += duration;
-    if error {
-        metric.errors = metric.errors.saturating_add(1);
-    }
+    state
+        .metrics
+        .lock()
+        .await
+        .record_tool_call(server_name, tool_name, duration, error_reason);
 }
 
 fn value_has_method(value: &Value, method: &str) -> bool {
@@ -355,6 +522,14 @@ fn value_has_method(value: &Value, method: &str) -> bool {
         return items.iter().any(|item| value_has_method(item, method));
     }
     value.get("method").and_then(Value::as_str) == Some(method)
+}
+
+fn initialize_response_succeeded(value: &Value) -> bool {
+    if let Some(items) = value.as_array() {
+        return items.iter().any(initialize_response_succeeded);
+    }
+    value.get("error").is_none()
+        && value.pointer("/result/serverInfo/name") == Some(&json!("mcpstead"))
 }
 
 fn downstream_response(
@@ -416,15 +591,12 @@ fn json_rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
     })
 }
 
-pub(crate) async fn get_mcp() -> impl IntoResponse {
-    (
-        StatusCode::METHOD_NOT_ALLOWED,
-        "server notifications are not implemented",
-    )
-}
-
-pub(crate) async fn delete_mcp(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !is_mcp_authorized(&headers, &state) {
+pub(crate) async fn get_mcp(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let started = Instant::now();
+    let auth = authorize_mcp(&headers, &state);
+    record_auth_decision(&state, auth).await;
+    if let AuthDecision::Deny(_) = auth {
+        record_mcp_request(&state, "listen", "error", started.elapsed().as_secs_f64()).await;
         return unauthorized_response();
     }
 
@@ -432,8 +604,44 @@ pub(crate) async fn delete_mcp(State(state): State<AppState>, headers: HeaderMap
         .get(MCP_SESSION_ID)
         .and_then(|value| value.to_str().ok())
     {
-        state.sessions.write().await.remove(session_id);
+        touch_session(&state, session_id).await;
     }
+    record_mcp_request(&state, "listen", "error", started.elapsed().as_secs_f64()).await;
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        "server notifications are not implemented",
+    )
+        .into_response()
+}
+
+pub(crate) async fn delete_mcp(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let started = Instant::now();
+    let auth = authorize_mcp(&headers, &state);
+    record_auth_decision(&state, auth).await;
+    if let AuthDecision::Deny(_) = auth {
+        record_mcp_request(
+            &state,
+            "terminate",
+            "error",
+            started.elapsed().as_secs_f64(),
+        )
+        .await;
+        return unauthorized_response();
+    }
+
+    if let Some(session_id) = headers
+        .get(MCP_SESSION_ID)
+        .and_then(|value| value.to_str().ok())
+    {
+        terminate_session(&state, session_id, "client_delete").await;
+    }
+    record_mcp_request(
+        &state,
+        "terminate",
+        "success",
+        started.elapsed().as_secs_f64(),
+    )
+    .await;
     StatusCode::ACCEPTED.into_response()
 }
 
@@ -445,26 +653,32 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::{Config, McpAuthConfig, McpAuthMode, McpConfig};
-    use crate::state::build_state;
+    use crate::state::{build_state, stop_accepting_new_sessions};
 
-    fn test_app(mode: McpAuthMode, token: Option<&str>) -> Router {
+    fn test_state(mode: McpAuthMode, token: Option<&str>) -> AppState {
         let config = Config {
             mcp: McpConfig {
                 auth: McpAuthConfig {
                     mode,
                     bearer_token: None,
                 },
+                ..McpConfig::default()
             },
             ..Config::default()
         };
-        Router::new()
-            .route("/mcp", post(post_mcp).delete(delete_mcp))
-            .with_state(build_state(&config, token.map(ToOwned::to_owned)).unwrap())
+        build_state(&config, token.map(ToOwned::to_owned)).unwrap()
     }
 
-    async fn post_initialize(
+    fn test_app(mode: McpAuthMode, token: Option<&str>) -> Router {
+        Router::new()
+            .route("/mcp", post(post_mcp).delete(delete_mcp))
+            .with_state(test_state(mode, token))
+    }
+
+    async fn post_payload(
         app: &Router,
         auth: Option<&str>,
+        payload: Value,
     ) -> (axum::http::response::Parts, Bytes) {
         let mut builder = Request::builder()
             .method("POST")
@@ -473,21 +687,28 @@ mod tests {
         if let Some(auth) = auth {
             builder = builder.header("authorization", auth);
         }
-        let request = builder
-            .body(Body::from(
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": { "protocolVersion": "2024-11-05" }
-                })
-                .to_string(),
-            ))
-            .unwrap();
+        let request = builder.body(Body::from(payload.to_string())).unwrap();
         let response = app.clone().oneshot(request).await.unwrap();
         let (parts, body) = response.into_parts();
         let bytes = to_bytes(body, usize::MAX).await.unwrap();
         (parts, bytes)
+    }
+
+    async fn post_initialize(
+        app: &Router,
+        auth: Option<&str>,
+    ) -> (axum::http::response::Parts, Bytes) {
+        post_payload(
+            app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "protocolVersion": "2024-11-05" }
+            }),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -539,6 +760,57 @@ mod tests {
         assert!(parts.headers.get(MCP_SESSION_ID).is_some());
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_new_initialize_sessions() {
+        let state = test_state(McpAuthMode::None, None);
+        stop_accepting_new_sessions(&state);
+        let app = Router::new()
+            .route("/mcp", post(post_mcp).delete(delete_mcp))
+            .with_state(state);
+
+        let (parts, body) = post_initialize(&app, None).await;
+
+        assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(&body[..], b"gateway shutting down");
+    }
+
+    #[tokio::test]
+    async fn initialize_notification_records_init_failed() {
+        let state = test_state(McpAuthMode::None, None);
+        let app = Router::new()
+            .route("/mcp", post(post_mcp).delete(delete_mcp))
+            .with_state(state.clone());
+
+        let (parts, _body) = post_payload(
+            &app,
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "initialize",
+                "params": {}
+            }),
+        )
+        .await;
+
+        assert_eq!(parts.status, StatusCode::ACCEPTED);
+        assert!(parts.headers.get(MCP_SESSION_ID).is_none());
+        assert!(state.sessions.read().await.is_empty());
+        assert_eq!(
+            state
+                .metrics
+                .lock()
+                .await
+                .downstream_session_terminations
+                .get("init_failed"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn synthetic_tool_error_uses_internal_reason() {
+        assert_eq!(categorize_tool_error("synthetic"), "internal");
     }
 
     #[test]
