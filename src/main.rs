@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::{
     Router,
     routing::{get, post},
@@ -28,19 +28,22 @@ use upstream::{manage_server, server_names};
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(
-        short,
-        long,
-        env = "MCPSTEAD_CONFIG",
-        default_value = "config/mcpstead.yaml"
-    )]
-    config: PathBuf,
+    #[arg(short, long, env = "MCPSTEAD_CONFIG")]
+    config: Option<PathBuf>,
+}
+
+fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
+    let Some(path) = config else {
+        bail!("mcpstead requires --config <path> or MCPSTEAD_CONFIG=<path>");
+    };
+    Ok(path)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let config = load_config(&args.config).await?;
+    let config_path = resolve_config_path(args.config)?;
+    let config = load_config(&config_path).await?;
     init_logging(&config.logging.level);
     validate_config(&config)?;
 
@@ -147,6 +150,16 @@ mod tests {
     use super::*;
 
     use crate::config::{Config, McpConfig, McpSessionConfig};
+
+    #[test]
+    fn resolve_config_path_requires_explicit_config() {
+        let err = resolve_config_path(None).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("mcpstead requires --config <path> or MCPSTEAD_CONFIG=<path>"),
+            "{message}"
+        );
+    }
 
     #[tokio::test]
     async fn session_gc_task_stops_on_cancel() {

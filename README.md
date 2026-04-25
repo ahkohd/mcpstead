@@ -153,7 +153,7 @@ servers:
 
 ## Config
 
-Default path: `~/.config/mcpstead/config.yaml` (or `--config <path>`).
+Set the config path with `--config <path>` or the `MCPSTEAD_CONFIG` env var.
 
 ```yaml
 host: 0.0.0.0
@@ -213,11 +213,9 @@ logging:
 
 ## Observability
 
-Metrics label cardinality assumes a small bounded set of upstreams and tools. Tool-call series are keyed by `(server, tool)`.
-
 ### Metrics
 
-`/metrics` exposes Prometheus-format counters, gauges, and histograms:
+`/metrics` exposes Prometheus-format counters, gauges, and histograms. Label cardinality assumes a small bounded set of upstreams and tools; tool-call series are keyed by `(server, tool)`.
 
 ```
 mcpstead_build_info{version="...",rust_version="...",git_sha="..."}
