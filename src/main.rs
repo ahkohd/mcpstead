@@ -15,16 +15,19 @@ mod config;
 mod constants;
 mod downstream;
 mod metrics;
+mod reload;
 mod state;
 mod upstream;
 
 use config::{load_config, load_mcp_bearer_token, validate_config};
 use downstream::{delete_mcp, get_mcp, post_mcp};
 use metrics::{health, metrics};
+use reload::{reload_config, reload_http};
 use state::{
-    AppState, build_state, prune_idle_sessions, stop_accepting_new_sessions, terminate_all_sessions,
+    AppState, build_state_with_config_path, prune_idle_sessions, stop_accepting_new_sessions,
+    terminate_all_sessions,
 };
-use upstream::{manage_server, server_names};
+use upstream::{server_names, spawn_server_manager};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -47,17 +50,16 @@ async fn main() -> Result<()> {
     init_logging(&config.logging.level);
     validate_config(&config)?;
 
-    let state = build_state(&config, load_mcp_bearer_token(&config)?)?;
+    let state =
+        build_state_with_config_path(&config, load_mcp_bearer_token(&config)?, config_path)?;
 
     for name in server_names(&state).await {
-        let state = state.clone();
-        tokio::spawn(async move {
-            manage_server(state, name).await;
-        });
+        spawn_server_manager(&state, name).await;
     }
 
     let shutdown_token = CancellationToken::new();
     tokio::spawn(session_gc_task(state.clone(), shutdown_token.clone()));
+    tokio::spawn(reload_signal_task(state.clone(), shutdown_token.clone()));
 
     let app = build_app(state.clone());
 
@@ -76,6 +78,7 @@ async fn main() -> Result<()> {
 fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/mcp", post(post_mcp).get(get_mcp).delete(delete_mcp))
+        .route("/-/reload", post(reload_http))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .layer(TraceLayer::new_for_http())
@@ -99,6 +102,35 @@ async fn session_gc_task(state: AppState, shutdown_token: CancellationToken) {
             }
         }
     }
+}
+
+#[cfg(unix)]
+async fn reload_signal_task(state: AppState, shutdown_token: CancellationToken) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut hangup = match signal(SignalKind::hangup()) {
+        Ok(signal) => signal,
+        Err(err) => {
+            error!(%err, "failed to install sighup handler");
+            return;
+        }
+    };
+
+    loop {
+        tokio::select! {
+            _ = shutdown_token.cancelled() => break,
+            _ = hangup.recv() => {
+                if let Err(err) = reload_config(&state).await {
+                    error!(%err, "sighup reload failed");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn reload_signal_task(_state: AppState, shutdown_token: CancellationToken) {
+    shutdown_token.cancelled().await;
 }
 
 #[cfg(unix)]
@@ -149,7 +181,10 @@ async fn shutdown_signal(state: AppState, shutdown_token: CancellationToken) {
 mod tests {
     use super::*;
 
-    use crate::config::{Config, McpConfig, McpSessionConfig};
+    use crate::{
+        config::{Config, McpConfig, McpSessionConfig},
+        state::build_state,
+    };
 
     #[test]
     fn resolve_config_path_requires_explicit_config() {

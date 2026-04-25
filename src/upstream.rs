@@ -47,6 +47,25 @@ pub(crate) async fn server_names(state: &AppState) -> Vec<String> {
         .collect()
 }
 
+pub(crate) async fn spawn_server_manager(state: &AppState, name: String) {
+    let task_state = state.clone();
+    let task_name = name.clone();
+    let handle = tokio::spawn(async move {
+        manage_server(task_state, task_name).await;
+    });
+    state.upstream_tasks.lock().await.insert(name, handle);
+}
+
+pub(crate) async fn abort_server_manager(state: &AppState, name: &str) {
+    if let Some(handle) = state.upstream_tasks.lock().await.remove(name) {
+        handle.abort();
+    }
+}
+
+pub(crate) async fn drop_upstream_session_reset_lock(state: &AppState, name: &str) {
+    state.upstream_session_reset_locks.lock().await.remove(name);
+}
+
 pub(crate) async fn manage_server(state: AppState, name: String) {
     let mut session_id: Option<String> = None;
     let mut failures = 0_u32;

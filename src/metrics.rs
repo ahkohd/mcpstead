@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, sync::atomic::Ordering};
 
 use axum::{
     Json,
@@ -61,7 +61,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<HealthResponse
 }
 
 pub(crate) async fn metrics(State(state): State<AppState>) -> Response {
-    if !state.metrics_enabled {
+    if !state.metrics_enabled.load(Ordering::Relaxed) {
         return (StatusCode::NOT_FOUND, "metrics disabled\n").into_response();
     }
 
@@ -370,6 +370,25 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Response {
         output.push_str(&format!(
             "mcpstead_mcp_auth_failures_total{{reason=\"{}\"}} {}\n",
             escape_label(reason),
+            value
+        ));
+    }
+
+    output.push_str("# HELP mcpstead_config_reloads_total Config reload attempts.\n");
+    output.push_str("# TYPE mcpstead_config_reloads_total counter\n");
+    for (result, value) in &metrics.config_reloads {
+        output.push_str(&format!(
+            "mcpstead_config_reloads_total{{result=\"{}\"}} {}\n",
+            escape_label(result),
+            value
+        ));
+    }
+
+    output.push_str("# HELP mcpstead_config_last_reload_timestamp_seconds Last successful config reload timestamp.\n");
+    output.push_str("# TYPE mcpstead_config_last_reload_timestamp_seconds gauge\n");
+    if let Some(value) = metrics.config_last_reload_timestamp_seconds {
+        output.push_str(&format!(
+            "mcpstead_config_last_reload_timestamp_seconds {:.6}\n",
             value
         ));
     }

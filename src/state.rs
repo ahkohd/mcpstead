@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -10,7 +11,10 @@ use std::{
 use anyhow::Result;
 use reqwest::Client;
 use serde_json::Value;
-use tokio::sync::{Mutex, RwLock};
+use tokio::{
+    sync::{Mutex, RwLock},
+    task::JoinHandle,
+};
 
 use crate::config::{Config, McpAuthMode, ServerConfig};
 
@@ -26,18 +30,27 @@ pub(crate) struct AppState {
     pub(crate) registry: Arc<RwLock<Registry>>,
     pub(crate) metrics: Arc<Mutex<Metrics>>,
     pub(crate) sessions: Arc<RwLock<HashMap<String, DownstreamSession>>>,
+    pub(crate) live_config: Arc<RwLock<Config>>,
+    pub(crate) config_path: Arc<PathBuf>,
+    pub(crate) upstream_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     pub(crate) upstream_session_reset_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    pub(crate) reload_lock: Arc<Mutex<()>>,
     pub(crate) accepting_new_sessions: Arc<AtomicBool>,
     pub(crate) session_idle_ttl: Duration,
     pub(crate) session_gc_interval: Duration,
     pub(crate) session_shutdown_grace: Duration,
     pub(crate) client: Client,
     pub(crate) insecure_client: Client,
-    pub(crate) mcp_auth_mode: McpAuthMode,
-    pub(crate) mcp_bearer_token: Option<String>,
+    pub(crate) mcp_auth: Arc<RwLock<McpAuthState>>,
     pub(crate) start: Instant,
     pub(crate) start_unix_seconds: f64,
-    pub(crate) metrics_enabled: bool,
+    pub(crate) metrics_enabled: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+pub(crate) struct McpAuthState {
+    pub(crate) mode: McpAuthMode,
+    pub(crate) bearer_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -92,6 +105,8 @@ pub(crate) struct Metrics {
     pub(crate) upstream_current_backoff_seconds: BTreeMap<String, f64>,
     pub(crate) upstream_session_resets: BTreeMap<(String, String), u64>,
     pub(crate) upstream_tools_refresh: BTreeMap<(String, String), u64>,
+    pub(crate) config_reloads: BTreeMap<String, u64>,
+    pub(crate) config_last_reload_timestamp_seconds: Option<f64>,
     pub(crate) upstream_tools_refresh_duration: BTreeMap<String, HistogramMetric>,
     pub(crate) upstream_tools_last_refresh_timestamp_seconds: BTreeMap<String, f64>,
     pub(crate) mcp_auth_attempts: BTreeMap<String, u64>,
@@ -242,6 +257,13 @@ impl Metrics {
             .entry((server.to_string(), direction.to_string()))
             .or_insert(0) += bytes;
     }
+
+    pub(crate) fn record_config_reload(&mut self, result: &str) {
+        *self.config_reloads.entry(result.to_string()).or_insert(0) += 1;
+        if result == "success" {
+            self.config_last_reload_timestamp_seconds = Some(unix_now_seconds());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -357,7 +379,16 @@ pub(crate) async fn terminate_all_sessions(state: &AppState, reason: &str) -> us
     count
 }
 
+#[cfg(test)]
 pub(crate) fn build_state(config: &Config, mcp_bearer_token: Option<String>) -> Result<AppState> {
+    build_state_with_config_path(config, mcp_bearer_token, PathBuf::new())
+}
+
+pub(crate) fn build_state_with_config_path(
+    config: &Config,
+    mcp_bearer_token: Option<String>,
+    config_path: PathBuf,
+) -> Result<AppState> {
     let registry = Registry {
         servers: config
             .servers
@@ -371,7 +402,11 @@ pub(crate) fn build_state(config: &Config, mcp_bearer_token: Option<String>) -> 
         registry: Arc::new(RwLock::new(registry)),
         metrics: Arc::new(Mutex::new(Metrics::default())),
         sessions: Arc::new(RwLock::new(HashMap::new())),
+        live_config: Arc::new(RwLock::new(config.clone())),
+        config_path: Arc::new(config_path),
+        upstream_tasks: Arc::new(Mutex::new(HashMap::new())),
         upstream_session_reset_locks: Arc::new(Mutex::new(HashMap::new())),
+        reload_lock: Arc::new(Mutex::new(())),
         accepting_new_sessions: Arc::new(AtomicBool::new(true)),
         session_idle_ttl: Duration::from_secs(config.mcp.session.idle_ttl_seconds.max(1)),
         session_gc_interval: Duration::from_secs(config.mcp.session.gc_interval_seconds.max(1)),
@@ -385,11 +420,13 @@ pub(crate) fn build_state(config: &Config, mcp_bearer_token: Option<String>) -> 
             .user_agent(format!("mcpstead/{}", env!("CARGO_PKG_VERSION")))
             .danger_accept_invalid_certs(true)
             .build()?,
-        mcp_auth_mode: config.mcp.auth.mode,
-        mcp_bearer_token,
+        mcp_auth: Arc::new(RwLock::new(McpAuthState {
+            mode: config.mcp.auth.mode,
+            bearer_token: mcp_bearer_token,
+        })),
         start: Instant::now(),
         start_unix_seconds: unix_now_seconds(),
-        metrics_enabled: config.metrics.enabled,
+        metrics_enabled: Arc::new(AtomicBool::new(config.metrics.enabled)),
     })
 }
 

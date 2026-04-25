@@ -69,6 +69,7 @@ The Dockerfile installs from crates.io.
 | `DELETE` | `/mcp` | terminate downstream session |
 | `GET` | `/health` | upstream status, tool counts, last-seen, reconnects |
 | `GET` | `/metrics` | Prometheus text format |
+| `POST` | `/-/reload` | reload config without restart |
 
 ## MCP client setup
 
@@ -149,7 +150,7 @@ servers:
       X-API-Key: '${EXAMPLE_KEY}'
 ```
 
-`token_env` resolves the named env var at startup. Avoid raw upstream tokens in committed config.
+`token_env` resolves the named env var at startup and on config reload. Avoid raw upstream tokens in committed config.
 
 ## Config
 
@@ -190,6 +191,29 @@ metrics:
 logging:
   level: info
 ```
+
+### Hot reload
+
+mcpstead reloads its config without restart on:
+
+- SIGHUP (`systemctl reload mcpstead` or `kill -HUP <pid>`)
+- `POST /-/reload` (gated by bearer auth in bearer mode)
+
+Hot-reloadable:
+
+- upstream list
+- per-upstream auth, headers, quirks, reconnect, tools, URL, protocol, and TLS settings
+- `mcp.auth.mode` and `MCPSTEAD_BEARER_TOKEN`
+- `metrics.enabled`
+
+Restart required:
+
+- `host`
+- `port`
+- `logging.level`
+- `mcp.session.*`
+
+Reload is best-effort. Bad config is rejected and ignored; the running config stays in place. Check logs and `mcpstead_config_reloads_total{result="error"}` for failures.
 
 ### MCP session config keys
 
@@ -251,6 +275,8 @@ mcpstead_mcp_requests_total{method="...",result="success|error"}
 mcpstead_mcp_request_duration_seconds_bucket{method="...",le="..."}
 mcpstead_mcp_auth_attempts_total{result="success|failure"}
 mcpstead_mcp_auth_failures_total{reason="..."}
+mcpstead_config_reloads_total{result="success|error"}
+mcpstead_config_last_reload_timestamp_seconds
 mcpstead_tool_calls_total{server="...",tool="..."}
 mcpstead_tool_call_errors_total{server="...",tool="...",reason="..."}
 mcpstead_tool_call_duration_seconds_bucket{server="...",tool="...",le="..."}

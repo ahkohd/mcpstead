@@ -10,7 +10,7 @@ use tracing::warn;
 
 const DEFAULT_ACCEPT: &str = "application/json, text/event-stream";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub(crate) struct Config {
     pub(crate) host: String,
@@ -34,21 +34,21 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub(crate) struct McpConfig {
     pub(crate) auth: McpAuthConfig,
     pub(crate) session: McpSessionConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub(crate) struct McpAuthConfig {
     pub(crate) mode: McpAuthMode,
     pub(crate) bearer_token: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub(crate) struct McpSessionConfig {
     pub(crate) idle_ttl_seconds: u64,
@@ -82,7 +82,7 @@ pub(crate) enum McpAuthMode {
     Bearer,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub(crate) struct ServerConfig {
     pub(crate) name: String,
@@ -122,6 +122,14 @@ impl ServerConfig {
             .unwrap_or(DEFAULT_ACCEPT)
     }
 
+    pub(crate) fn requires_fresh_upstream_session(&self, other: &Self) -> bool {
+        self.url != other.url
+            || self.protocol != other.protocol
+            || self.tls_skip_verify != other.tls_skip_verify
+            || self.auth != other.auth
+            || self.headers != other.headers
+    }
+
     pub(crate) fn bearer_token(&self) -> Result<Option<String>> {
         match &self.auth {
             None => Ok(None),
@@ -147,14 +155,14 @@ impl ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(untagged)]
 enum AuthConfig {
     Mode(String),
     Object(AuthObject),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 struct AuthObject {
     #[serde(rename = "type")]
     kind: String,
@@ -162,14 +170,14 @@ struct AuthObject {
     token_env: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(default)]
 struct QuirksConfig {
     normalize_sse_events: bool,
     inject_accept_header: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub(crate) struct ReconnectConfig {
     pub(crate) max_attempts: u32,
@@ -187,7 +195,7 @@ impl Default for ReconnectConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub(crate) struct ToolsConfig {
     pub(crate) ttl_seconds: u64,
@@ -199,7 +207,7 @@ impl Default for ToolsConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub(crate) struct MetricsConfig {
     pub(crate) enabled: bool,
@@ -211,7 +219,7 @@ impl Default for MetricsConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub(crate) struct LoggingConfig {
     pub(crate) level: String,

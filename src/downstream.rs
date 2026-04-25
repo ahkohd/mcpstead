@@ -34,16 +34,17 @@ fn get_header(headers: &HeaderMap, key: &str) -> Option<String> {
 }
 
 #[derive(Clone, Copy)]
-enum AuthDecision {
+pub(crate) enum AuthDecision {
     Allow,
     Deny(&'static str),
 }
 
-fn authorize_mcp(headers: &HeaderMap, state: &AppState) -> AuthDecision {
-    match state.mcp_auth_mode {
+pub(crate) async fn authorize_mcp(headers: &HeaderMap, state: &AppState) -> AuthDecision {
+    let auth_state = state.mcp_auth.read().await.clone();
+    match auth_state.mode {
         McpAuthMode::None => AuthDecision::Allow,
         McpAuthMode::Bearer => {
-            let Some(token) = &state.mcp_bearer_token else {
+            let Some(token) = &auth_state.bearer_token else {
                 return AuthDecision::Deny("internal");
             };
             let Some(auth) = get_header(headers, "authorization") else {
@@ -64,8 +65,8 @@ fn authorize_mcp(headers: &HeaderMap, state: &AppState) -> AuthDecision {
     }
 }
 
-async fn record_auth_decision(state: &AppState, decision: AuthDecision) {
-    if state.mcp_auth_mode != McpAuthMode::Bearer {
+pub(crate) async fn record_auth_decision(state: &AppState, decision: AuthDecision) {
+    if state.mcp_auth.read().await.mode != McpAuthMode::Bearer {
         return;
     }
     let mut metrics = state.metrics.lock().await;
@@ -75,7 +76,7 @@ async fn record_auth_decision(state: &AppState, decision: AuthDecision) {
     }
 }
 
-fn unauthorized_response() -> Response {
+pub(crate) fn unauthorized_response() -> Response {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         .header(WWW_AUTHENTICATE, "Bearer")
@@ -89,7 +90,7 @@ pub(crate) async fn post_mcp(
     body: Bytes,
 ) -> Response {
     let request_started = Instant::now();
-    let auth = authorize_mcp(&headers, &state);
+    let auth = authorize_mcp(&headers, &state).await;
     record_auth_decision(&state, auth).await;
     if let AuthDecision::Deny(_) = auth {
         record_mcp_request(
@@ -593,7 +594,7 @@ fn json_rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
 
 pub(crate) async fn get_mcp(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let started = Instant::now();
-    let auth = authorize_mcp(&headers, &state);
+    let auth = authorize_mcp(&headers, &state).await;
     record_auth_decision(&state, auth).await;
     if let AuthDecision::Deny(_) = auth {
         record_mcp_request(&state, "listen", "error", started.elapsed().as_secs_f64()).await;
@@ -616,7 +617,7 @@ pub(crate) async fn get_mcp(State(state): State<AppState>, headers: HeaderMap) -
 
 pub(crate) async fn delete_mcp(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let started = Instant::now();
-    let auth = authorize_mcp(&headers, &state);
+    let auth = authorize_mcp(&headers, &state).await;
     record_auth_decision(&state, auth).await;
     if let AuthDecision::Deny(_) = auth {
         record_mcp_request(
