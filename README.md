@@ -150,7 +150,7 @@ servers:
       X-API-Key: '${EXAMPLE_KEY}'
 ```
 
-`token_env` resolves the named env var at startup and on config reload. Avoid raw upstream tokens in committed config.
+`token_env` resolves the named env var at startup and on config reload.
 
 ## Config
 
@@ -227,7 +227,7 @@ Reload is best-effort. Bad config is rejected and ignored; the running config st
 - `url` - required, MCP endpoint
 - `protocol` - `streamable | sse | auto` (default `auto`)
 - `required` - block startup if upstream fails to initialize (default `false`)
-- `auth` - `none`, `bearer` (with `token` or `token_env`), or `headers` map
+- `auth` - `none`, `bearer` (with `token_env`), or `headers` map
 - `reconnect.max_attempts` - `0` = infinite (default)
 - `reconnect.backoff_base_ms` / `backoff_max_ms` - exponential backoff bounds
 - `tools.ttl_seconds` - refresh cached `tools/list` after this interval

@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, de};
 use tracing::warn;
 
 const DEFAULT_ACCEPT: &str = "application/json, text/event-stream";
@@ -130,6 +130,23 @@ impl ServerConfig {
             || self.headers != other.headers
     }
 
+    pub(crate) fn validate_auth_config(&self) -> Result<()> {
+        match &self.auth {
+            None => Ok(()),
+            Some(AuthConfig::Mode(mode)) if mode == "none" => Ok(()),
+            Some(AuthConfig::Mode(mode)) => bail!("unsupported auth mode '{mode}'"),
+            Some(AuthConfig::Object(auth)) if auth.kind == "none" => Ok(()),
+            Some(AuthConfig::Object(auth)) if auth.kind == "bearer" => {
+                if auth.token_env.is_some() {
+                    Ok(())
+                } else {
+                    bail!("bearer auth for server '{}' requires token_env", self.name)
+                }
+            }
+            Some(AuthConfig::Object(auth)) => bail!("unsupported auth type '{}'", auth.kind),
+        }
+    }
+
     pub(crate) fn bearer_token(&self) -> Result<Option<String>> {
         match &self.auth {
             None => Ok(None),
@@ -137,36 +154,55 @@ impl ServerConfig {
             Some(AuthConfig::Mode(mode)) => bail!("unsupported auth mode '{mode}'"),
             Some(AuthConfig::Object(auth)) if auth.kind == "none" => Ok(None),
             Some(AuthConfig::Object(auth)) if auth.kind == "bearer" => {
-                if let Some(token) = &auth.token {
-                    return Ok(Some(token.clone()));
-                }
-                if let Some(name) = &auth.token_env {
-                    return Ok(Some(env::var(name).with_context(|| {
-                        format!("missing env var '{name}' for server '{}'", self.name)
-                    })?));
-                }
-                bail!(
-                    "bearer auth for server '{}' needs token or token_env",
-                    self.name
-                )
+                let Some(name) = &auth.token_env else {
+                    bail!("bearer auth for server '{}' requires token_env", self.name);
+                };
+                Ok(Some(env::var(name).with_context(|| {
+                    format!("missing env var '{name}' for server '{}'", self.name)
+                })?))
             }
             Some(AuthConfig::Object(auth)) => bail!("unsupported auth type '{}'", auth.kind),
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq)]
 enum AuthConfig {
     Mode(String),
     Object(AuthObject),
 }
 
+impl<'de> Deserialize<'de> for AuthConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        // Config is YAML-only today, so use serde_yaml::Value to reject raw token early.
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::String(mode) => Ok(Self::Mode(mode)),
+            serde_yaml::Value::Mapping(mapping) => {
+                if mapping.contains_key(serde_yaml::Value::String("token".to_string())) {
+                    return Err(de::Error::custom(
+                        "upstream auth token field is not allowed; use token_env",
+                    ));
+                }
+                let auth = serde_yaml::from_value(serde_yaml::Value::Mapping(mapping))
+                    .map_err(de::Error::custom)?;
+                Ok(Self::Object(auth))
+            }
+            _ => Err(de::Error::custom(
+                "upstream auth must be 'none' or an object with type",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 struct AuthObject {
     #[serde(rename = "type")]
     kind: String,
-    token: Option<String>,
     token_env: Option<String>,
 }
 
@@ -276,6 +312,7 @@ pub(crate) fn validate_config(config: &Config) -> Result<()> {
         if !names.insert(server.name.clone()) {
             bail!("duplicate server name '{}'", server.name);
         }
+        server.validate_auth_config()?;
     }
     Ok(())
 }
@@ -334,6 +371,78 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("mcp.session.idle_ttl_seconds must be greater than 0")
+        );
+    }
+
+    #[test]
+    fn rejects_upstream_bearer_without_token_env() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+            servers:
+              - name: example
+                url: http://127.0.0.1:3000/mcp
+                auth:
+                  type: bearer
+            "#,
+        )
+        .unwrap();
+        let err = validate_config(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("bearer auth for server 'example' requires token_env")
+        );
+    }
+
+    #[test]
+    fn resolves_upstream_bearer_token_from_env() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let env_name = format!(
+            "MCPSTEAD_TEST_UPSTREAM_TOKEN_{}_{}",
+            std::process::id(),
+            stamp
+        );
+        let config: Config = serde_yaml::from_str(&format!(
+            r#"
+            servers:
+              - name: example
+                url: http://127.0.0.1:3000/mcp
+                auth:
+                  type: bearer
+                  token_env: {env_name}
+            "#,
+        ))
+        .unwrap();
+        validate_config(&config).unwrap();
+        unsafe {
+            env::set_var(&env_name, "secret");
+        }
+        let token = config.servers[0].bearer_token().unwrap();
+        unsafe {
+            env::remove_var(&env_name);
+        }
+        assert_eq!(token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn rejects_raw_upstream_bearer_token_field() {
+        let err = serde_yaml::from_str::<Config>(
+            r#"
+            servers:
+              - name: example
+                url: http://127.0.0.1:3000/mcp
+                auth:
+                  type: bearer
+                  token: raw-secret
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("upstream auth token field is not allowed; use token_env"),
+            "{err}"
         );
     }
 }
