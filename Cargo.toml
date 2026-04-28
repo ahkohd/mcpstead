@@ -1,6 +1,6 @@
 [package]
 name = "mcpstead"
-version = "0.1.11"
+version = "0.1.12"
 # Rust 2024 edition requires Rust 1.85 or newer.
 edition = "2024"
 rust-version = "1.85"
