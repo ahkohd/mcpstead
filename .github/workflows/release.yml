@@ -289,24 +289,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check deploy key and tap repo
+      - name: Check token and tap repo
         id: tap
         env:
-          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          if [ -z "${TAP_DEPLOY_KEY}" ]; then
+          if [ -z "${GH_TOKEN}" ]; then
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "reason=missing_key" >> "$GITHUB_OUTPUT"
+            echo "reason=missing_token" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "${TAP_DEPLOY_KEY}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
-
-          if git ls-remote "git@github.com:${HOMEBREW_TAP_REPO}.git" >/dev/null 2>&1; then
+          if git ls-remote "https://github.com/${HOMEBREW_TAP_REPO}.git" >/dev/null 2>&1; then
             echo "ready=true" >> "$GITHUB_OUTPUT"
             echo "reason=ok" >> "$GITHUB_OUTPUT"
           else
@@ -317,8 +311,8 @@ jobs:
       - name: Skip summary
         if: ${{ steps.tap.outputs.ready != 'true' }}
         run: |
-          if [ "${{ steps.tap.outputs.reason }}" = "missing_key" ]; then
-            echo "- Homebrew update skipped (missing HOMEBREW_TAP_DEPLOY_KEY secret)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.tap.outputs.reason }}" = "missing_token" ]; then
+            echo "- Homebrew update skipped (missing HOMEBREW_TAP_TOKEN secret)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "- Homebrew update skipped (missing repo ${HOMEBREW_TAP_REPO})" >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -340,13 +334,15 @@ jobs:
 
       - name: Update formula
         if: ${{ steps.tap.outputs.ready == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           VERSION="${{ needs.release.outputs.version }}"
           SHA_MACOS_ARM64="${{ steps.sha.outputs.macos_arm64 }}"
           SHA_MACOS_X86_64="${{ steps.sha.outputs.macos_x86_64 }}"
           SHA_LINUX_X86_64="${{ steps.sha.outputs.linux_x86_64 }}"
 
-          git clone "git@github.com:${HOMEBREW_TAP_REPO}.git"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${HOMEBREW_TAP_REPO}.git"
           cd "${HOMEBREW_TAP_REPO##*/}"
 
           mkdir -p Formula
