@@ -13,7 +13,7 @@ One downstream `/mcp` endpoint that fronts many upstream MCP servers. Persistent
 npm i -g @ahkohd/mcpstead
 
 # homebrew (macOS, Linux)
-brew install ahkohd/tap/mcpstead
+brew install ahkohd/mcpstead/mcpstead
 
 # cargo
 cargo install mcpstead --locked --force
